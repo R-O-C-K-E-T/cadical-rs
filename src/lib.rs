@@ -7,6 +7,7 @@
 //! overall place. It was written by Armin Biere, and it is available under the
 //! MIT license.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int, c_void};
@@ -35,6 +36,18 @@ extern "C" {
         max_len: c_int,
         cbs: Option<extern "C" fn(*mut c_void, *const c_int)>,
     );
+    fn ccadical_connect_external_propagator(
+        ptr: *mut c_void,
+        data: *mut c_void,
+        notify_assignment: extern "C" fn(*mut c_void, c_int, bool),
+        notify_new_decision_level: extern "C" fn(*mut c_void),
+        notify_backtrack: extern "C" fn(*mut c_void, usize),
+        cb_propagate: extern "C" fn(*mut c_void) -> c_int,
+        cb_add_reason_clause_lit: extern "C" fn(*mut c_void, c_int) -> c_int
+    ) -> *mut c_void;
+    fn ccadical_disconnect_external_propagator(ptr: *mut c_void, propagator: *mut c_void);
+    fn ccadical_add_observed_var(ptr: *mut c_void, lit: c_int);
+    fn ccadical_remove_observed_var(ptr: *mut c_void, lit: c_int);
     fn ccadical_status(ptr: *mut c_void) -> c_int;
     fn ccadical_vars(ptr: *mut c_void) -> c_int;
     fn ccadical_active(ptr: *mut c_void) -> i64;
@@ -68,14 +81,21 @@ extern "C" {
 
 pub struct Solver<C: Callbacks = Timeout> {
     ptr: *mut c_void,
+    external_propagator: *mut c_void,
     cbs: Option<Box<C>>,
+    reasons: HashMap<i32, Vec<i32>>
 }
 
 impl<C: Callbacks> Solver<C> {
     /// Constructs a new solver instance.
     pub fn new() -> Self {
         let ptr = unsafe { ccadical_init() };
-        Self { ptr, cbs: None }
+        Self { 
+            ptr, 
+            cbs: None, 
+            external_propagator: null_mut(),
+            reasons: HashMap::new(),
+        }
     }
 
     /// Constructs a new solver with one of the following pre-defined
@@ -267,6 +287,16 @@ impl<C: Callbacks> Solver<C> {
             unsafe {
                 ccadical_set_terminate(self.ptr, data, Some(Self::terminate_cb));
                 ccadical_set_learn(self.ptr, data, max_length, Some(Self::learn_cb));
+
+                self.external_propagator = ccadical_connect_external_propagator(
+                    self.ptr,
+                    self as *mut Solver<C> as *mut c_void,
+                    Self::notify_assignment,
+                    Self::notify_new_decision_level,
+                    Self::notify_backtrack,
+                    Self::cb_propagate,
+                    Self::cb_add_reason_clause_lit
+                );
             }
         } else {
             self.cbs = None;
@@ -274,7 +304,20 @@ impl<C: Callbacks> Solver<C> {
             unsafe {
                 ccadical_set_terminate(self.ptr, data, None);
                 ccadical_set_learn(self.ptr, data, 0, None);
+                ccadical_disconnect_external_propagator(self.ptr, self.external_propagator);
             }
+        }
+    }
+
+    pub fn add_observed(&mut self, lit: i32) {
+        unsafe {
+            ccadical_add_observed_var(self.ptr, lit);
+        }
+    }
+
+    pub fn remove_observed(&mut self, lit: i32) {
+        unsafe {
+            ccadical_remove_observed_var(self.ptr, lit);
         }
     }
 
@@ -296,6 +339,53 @@ impl<C: Callbacks> Solver<C> {
 
         let cbs = unsafe { &mut *(data as *mut C) };
         cbs.learn(&clause);
+    }
+
+    extern "C" fn notify_assignment(data: *mut c_void, lit: c_int, is_fixed: bool) {
+        debug_assert!(!data.is_null());
+
+        let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        solver
+            .cbs
+            .as_mut()
+            .expect("set_callbacks must have been called with non-null cbs")
+            .notify_assignment(lit, is_fixed)
+    }
+    extern "C" fn notify_new_decision_level(data: *mut c_void) {
+        let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        solver
+            .cbs
+            .as_mut()
+            .expect("set_callbacks must have been called with non-null cbs")
+            .notify_new_decision_level()
+    }
+    extern "C" fn notify_backtrack(data: *mut c_void, new_level: usize) {
+        let cbs = unsafe { &mut *(data as *mut C) };
+        cbs.notify_backtrack(new_level)
+    }
+    extern "C" fn cb_propagate(data: *mut c_void) -> c_int {
+        let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        
+        let propagation = solver
+            .cbs
+            .as_mut()
+            .expect("set_callbacks must have been called with non-null cbs")
+            .propagate();
+
+        match propagation {
+            None => 0,
+            Some((lit, reason)) => {
+                solver.reasons.insert(lit, reason.into_vec());
+                lit
+            },
+        }
+    }
+    extern "C" fn cb_add_reason_clause_lit(data: *mut c_void, lit: c_int) -> c_int {
+        let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        let reason = solver.reasons.get_mut(&lit);
+        
+        // Honestly unsure what a null reason would mean here
+        reason.and_then(|reason| reason.pop()).unwrap_or(0)
     }
 
     /// Returns a mutable reference to the callbacks.
@@ -384,6 +474,24 @@ pub trait Callbacks {
     #[allow(unused_variables)]
     #[inline(always)]
     fn learn(&mut self, clause: &[i32]) {}
+
+    #[inline(always)]
+    fn notify_new_decision_level(&mut self) {}
+    
+    #[allow(unused_variables)]
+    #[inline(always)]
+    fn notify_assignment(&mut self, lit: i32, is_fixed: bool) {}
+
+    #[allow(unused_variables)]
+    #[inline(always)]
+    fn notify_backtrack(&mut self, new_level: usize) {}
+
+
+    #[allow(unused_variables)]
+    #[inline(always)]
+    fn propagate(&mut self) -> Option<(i32, Box<[i32]>)> {
+        None
+    }
 }
 
 /// Callbacks implementing a simple timeout.
@@ -411,6 +519,29 @@ impl Callbacks for Timeout {
     #[inline(always)]
     fn terminate(&mut self) -> bool {
         self.started.elapsed().as_secs_f32() >= self.timeout
+    }
+}
+
+struct TraceSolve {
+}
+
+impl TraceSolve {
+    pub fn new() -> Self {
+        TraceSolve {}
+    }
+}
+
+impl Callbacks for TraceSolve {
+    fn notify_assignment(&mut self, lit: i32, is_fixed: bool) {
+        println!("notify_assignment lit={}, is_fixed={}", lit, is_fixed);
+    }
+
+    fn notify_backtrack(&mut self, new_level: usize) {
+        println!("notify_backtrack new_level={}", new_level);
+    }
+
+    fn notify_new_decision_level(&mut self) {
+        println!("notify_new_decision_level");
     }
 }
 
@@ -470,8 +601,8 @@ mod tests {
         assert_eq!(sat.failed(-4), false);
     }
 
-    fn pigeon_hole(num: i32) -> Solver {
-        let mut sat: Solver = Solver::new();
+    fn pigeon_hole<C: Callbacks>(num: i32) -> Solver<C> {
+        let mut sat: Solver<C> = Solver::new();
         for i in 0..(num + 1) {
             sat.add_clause((0..num).map(|j| 1 + i * num + j));
         }
@@ -492,7 +623,7 @@ mod tests {
 
     #[test]
     fn timeout() {
-        let mut sat = pigeon_hole(9);
+        let mut sat: Solver<Timeout> = pigeon_hole(9);
         let started = Instant::now();
         sat.set_callbacks(Some(Timeout::new(0.2)));
         let result = sat.solve();
@@ -518,8 +649,20 @@ mod tests {
     }
 
     #[test]
+    fn ipasir_up() {
+        let mut sat: Solver<TraceSolve> = pigeon_hole(8);
+
+        sat.set_callbacks(Some(TraceSolve::new()));
+        for i in 1..(sat.max_variable() + 1) {
+            sat.add_observed(i);
+        }
+
+        sat.solve();
+    }
+
+    #[test]
     fn decision_limit() {
-        let mut sat = pigeon_hole(5);
+        let mut sat: Solver<Timeout> = pigeon_hole(5);
         sat.set_limit("decisions", 100).unwrap();
         let result = sat.solve();
         assert_eq!(result, None);
@@ -530,7 +673,7 @@ mod tests {
 
     #[test]
     fn conflict_limit() {
-        let mut sat = pigeon_hole(5);
+        let mut sat: Solver<Timeout> = pigeon_hole(5);
         sat.set_limit("conflicts", 100).unwrap();
         let result = sat.solve();
         assert_eq!(result, None);
@@ -541,14 +684,14 @@ mod tests {
 
     #[test]
     fn bad_limit() {
-        let mut sat = pigeon_hole(5);
+        let mut sat: Solver<Timeout> = pigeon_hole(5);
         assert!(sat.set_limit("\0", 0) == Err(Error::new("invalid string")));
         assert!(sat.set_limit("bad", 0) == Err(Error::new("unknown limit")));
     }
 
     #[test]
     fn moving() {
-        let mut sat = pigeon_hole(5);
+        let mut sat: Solver<Timeout> = pigeon_hole(5);
         let id = thread::spawn(move || {
             assert_eq!(sat.solve(), Some(false));
         });
@@ -560,7 +703,7 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push("pigeon5.cnf");
 
-        let mut sat = pigeon_hole(5);
+        let mut sat: Solver<Timeout> = pigeon_hole(5);
         println!("writing DIMACS to: {:?}", path);
         assert!(sat.write_dimacs(&path).is_ok());
         assert!(path.is_file());
