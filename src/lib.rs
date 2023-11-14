@@ -290,7 +290,7 @@ impl<C: Callbacks> Solver<C> {
 
                 self.external_propagator = ccadical_connect_external_propagator(
                     self.ptr,
-                    self as *mut Solver<C> as *mut c_void,
+                    data,
                     Self::notify_assignment,
                     Self::notify_new_decision_level,
                     Self::notify_backtrack,
@@ -344,48 +344,44 @@ impl<C: Callbacks> Solver<C> {
     extern "C" fn notify_assignment(data: *mut c_void, lit: c_int, is_fixed: bool) {
         debug_assert!(!data.is_null());
 
-        let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        solver
-            .cbs
-            .as_mut()
-            .expect("set_callbacks must have been called with non-null cbs")
-            .notify_assignment(lit, is_fixed)
+        let cbs = unsafe { &mut *(data as *mut C) };
+        cbs.notify_assignment(lit, is_fixed)
     }
     extern "C" fn notify_new_decision_level(data: *mut c_void) {
-        let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        solver
-            .cbs
-            .as_mut()
-            .expect("set_callbacks must have been called with non-null cbs")
-            .notify_new_decision_level()
+        let cbs = unsafe { &mut *(data as *mut C) };
+        cbs.notify_new_decision_level()
     }
     extern "C" fn notify_backtrack(data: *mut c_void, new_level: usize) {
         let cbs = unsafe { &mut *(data as *mut C) };
         cbs.notify_backtrack(new_level)
     }
     extern "C" fn cb_propagate(data: *mut c_void) -> c_int {
-        let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        
-        let propagation = solver
-            .cbs
-            .as_mut()
-            .expect("set_callbacks must have been called with non-null cbs")
-            .propagate();
+        let cbs = unsafe { &mut *(data as *mut C) };
+        cbs.propagate();
+        0 // TODO
+        // let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        // let propagation = solver
+        //     .cbs
+        //     .as_mut()
+        //     .expect("set_callbacks must have been called with non-null cbs")
+        //     .propagate();
 
-        match propagation {
-            None => 0,
-            Some((lit, reason)) => {
-                solver.reasons.insert(lit, reason.into_vec());
-                lit
-            },
-        }
+        // match propagation {
+        //     None => 0,
+        //     Some((lit, reason)) => {
+        //         solver.reasons.insert(lit, reason.into_vec());
+        //         lit
+        //     },
+        // }
     }
     extern "C" fn cb_add_reason_clause_lit(data: *mut c_void, lit: c_int) -> c_int {
-        let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        let reason = solver.reasons.get_mut(&lit);
+        let cbs = unsafe { &mut *(data as *mut C) };
+        0
+        // let solver = unsafe { &mut *(data as *mut Solver<C>) };
+        // let reason = solver.reasons.get_mut(&lit);
         
-        // Honestly unsure what a null reason would mean here
-        reason.and_then(|reason| reason.pop()).unwrap_or(0)
+        // // Honestly unsure what a null reason would mean here
+        // reason.and_then(|reason| reason.pop()).unwrap_or(0)
     }
 
     /// Returns a mutable reference to the callbacks.
