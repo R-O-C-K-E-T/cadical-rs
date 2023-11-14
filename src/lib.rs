@@ -79,11 +79,15 @@ extern "C" {
 /// assert_eq!(sat.value(2), Some(true));
 /// ```
 
+struct CallbackStore<C: Callbacks> {
+    callbacks: C,
+    reasons: HashMap<i32, Vec<i32>>,
+}
+
 pub struct Solver<C: Callbacks = Timeout> {
     ptr: *mut c_void,
     external_propagator: *mut c_void,
-    cbs: Option<Box<C>>,
-    reasons: HashMap<i32, Vec<i32>>
+    cbs: Option<Box<CallbackStore<C>>>,
 }
 
 impl<C: Callbacks> Solver<C> {
@@ -94,7 +98,6 @@ impl<C: Callbacks> Solver<C> {
             ptr, 
             cbs: None, 
             external_propagator: null_mut(),
-            reasons: HashMap::new(),
         }
     }
 
@@ -142,7 +145,7 @@ impl<C: Callbacks> Solver<C> {
     /// of resources or was terminated, then `None` is returned.
     pub fn solve(&mut self) -> Option<bool> {
         if let Some(cbs) = &mut self.cbs {
-            cbs.as_mut().started();
+            cbs.as_mut().callbacks.started();
         }
 
         let r = unsafe { ccadical_solve(self.ptr) };
@@ -277,13 +280,19 @@ impl<C: Callbacks> Solver<C> {
     pub fn set_callbacks(&mut self, cbs: Option<C>) {
         if let Some(cbs) = cbs {
             if let Some(data) = &mut self.cbs {
-                *data.as_mut() = cbs;
+                *data.as_mut() = CallbackStore {
+                    callbacks: cbs,
+                    reasons: HashMap::new(),
+                };
             } else {
-                self.cbs = Some(Box::new(cbs));
+                self.cbs = Some(Box::new(CallbackStore {
+                    callbacks: cbs,
+                    reasons: HashMap::new(),
+                }));
             }
             let data = self.cbs.as_mut().unwrap();
-            let max_length = data.max_length();
-            let data = data.as_mut() as *mut C as *mut c_void;
+            let max_length = data.callbacks.max_length();
+            let data = data.as_mut() as *mut CallbackStore<C> as *mut c_void;
             unsafe {
                 ccadical_set_terminate(self.ptr, data, Some(Self::terminate_cb));
                 ccadical_set_learn(self.ptr, data, max_length, Some(Self::learn_cb));
@@ -323,8 +332,8 @@ impl<C: Callbacks> Solver<C> {
 
     extern "C" fn terminate_cb(data: *mut c_void) -> c_int {
         debug_assert!(!data.is_null());
-        let cbs = unsafe { &mut *(data as *mut C) };
-        cbs.terminate() as c_int
+        let cbs = unsafe { &mut *(data as *mut CallbackStore<C>) };
+        cbs.callbacks.terminate() as c_int
     }
 
     extern "C" fn learn_cb(data: *mut c_void, clause: *const c_int) {
@@ -356,37 +365,24 @@ impl<C: Callbacks> Solver<C> {
         cbs.notify_backtrack(new_level)
     }
     extern "C" fn cb_propagate(data: *mut c_void) -> c_int {
-        let cbs = unsafe { &mut *(data as *mut C) };
-        cbs.propagate();
-        0 // TODO
-        // let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        // let propagation = solver
-        //     .cbs
-        //     .as_mut()
-        //     .expect("set_callbacks must have been called with non-null cbs")
-        //     .propagate();
-
-        // match propagation {
-        //     None => 0,
-        //     Some((lit, reason)) => {
-        //         solver.reasons.insert(lit, reason.into_vec());
-        //         lit
-        //     },
-        // }
+        let cbs = unsafe { &mut *(data as *mut CallbackStore<C>) };
+        let Some((lit, reason)) = cbs.callbacks.propagate() else {
+            return 0;
+        };
+        cbs.reasons.insert(lit, reason.into_vec());
+        lit
     }
     extern "C" fn cb_add_reason_clause_lit(data: *mut c_void, lit: c_int) -> c_int {
-        let cbs = unsafe { &mut *(data as *mut C) };
-        0
-        // let solver = unsafe { &mut *(data as *mut Solver<C>) };
-        // let reason = solver.reasons.get_mut(&lit);
+        let cbs = unsafe { &mut *(data as *mut CallbackStore<C>) };
+        let reason = cbs.reasons.get_mut(&lit);
         
-        // // Honestly unsure what a null reason would mean here
-        // reason.and_then(|reason| reason.pop()).unwrap_or(0)
+        // Honestly unsure what a null reason would mean here
+        reason.and_then(|reason| reason.pop()).unwrap_or(0)
     }
 
     /// Returns a mutable reference to the callbacks.
     pub fn get_callbacks(&mut self) -> Option<&mut C> {
-        self.cbs.as_mut().map(|a| a.as_mut())
+        self.cbs.as_mut().map(|a| &mut a.as_mut().callbacks)
     }
 
     /// Writes the problem in DIMACS format to the given file.
