@@ -366,11 +366,11 @@ impl<C: Callbacks> Solver<C> {
     }
     extern "C" fn cb_propagate(data: *mut c_void) -> c_int {
         let cbs = unsafe { &mut *(data as *mut CallbackStore<C>) };
-        let Some((lit, reason)) = cbs.callbacks.propagate() else {
+        let Some(conflict) = cbs.callbacks.propagate() else {
             return 0;
         };
-        cbs.reasons.insert(lit, reason.into_vec());
-        lit
+        cbs.reasons.insert(conflict.pivot, conflict.clause.into_vec());
+        conflict.pivot
     }
     extern "C" fn cb_add_reason_clause_lit(data: *mut c_void, lit: c_int) -> c_int {
         let cbs = unsafe { &mut *(data as *mut CallbackStore<C>) };
@@ -437,6 +437,11 @@ impl<C: Callbacks> Drop for Solver<C> {
     }
 }
 
+pub struct Conflict {
+    pub pivot: i32,
+    pub clause: Box<[i32]>
+}
+
 /// CaDiCaL does not use thread local variables, so it is possible to
 /// move it between threads. However it cannot be used queried concurrently
 /// (for example getting the value from multiple threads at once), so we
@@ -481,7 +486,7 @@ pub trait Callbacks {
 
     #[allow(unused_variables)]
     #[inline(always)]
-    fn propagate(&mut self) -> Option<(i32, Box<[i32]>)> {
+    fn propagate(&mut self) -> Option<Conflict> {
         None
     }
 }
